@@ -66,7 +66,7 @@ This repository contains several scripts that work together:
 
 1. Clone this repository:
 ```
-git clone https://github.com/yourusername/Polar-Recorder-and-LSL-Restream.git
+git clone https://github.com/Randomidous/Polar-Recorder-and-LSL-Restream
 cd Polar-Recorder-and-LSL-Restream
 ```
 

@@ -2,14 +2,14 @@ import threading
 import csv
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk, scrolledtext
+from tkinter import messagebox, ttk
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 import os
 import asyncio
 import struct
-import sys
+from collections import deque
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
 from pylsl import local_clock, StreamInfo, StreamOutlet
@@ -27,7 +27,10 @@ BATTERY_LEVEL = "00002a19-0000-1000-8000-00805f9b34fb"
 CLIENT_CHAR_CONFIG = "00002902-0000-1000-8000-00805f9b34fb"
 
 # PMD Control Commands
-PMD_COMMAND = bytearray([0x01, 0x00, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00])
+# Start ECG stream: 130 Hz, 14-bit resolution
+ECG_WRITE = bytearray([0x02, 0x00, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00])
+# Start ACC stream: 200 Hz, 16-bit resolution, ±8g range
+ACC_WRITE = bytearray([0x02, 0x02, 0x00, 0x01, 0xC8, 0x00, 0x01, 0x01, 0x10, 0x00, 0x02, 0x01, 0x08, 0x00])
 
 # Theme colors
 DARK_BG = "#1E1E2E"  # Dark background
@@ -46,27 +49,27 @@ class LSLGui:
         self.master.title("Polar H10 Recorder & Analyzer")
         self.master.geometry("2100x1050")
         self.master.configure(bg=DARK_BG)
-        
+
         # Configure the theme
         self.configure_theme()
-        
+
         # Create a main container with padding
         self.main_container = tk.Frame(master, bg=DARK_BG, padx=20, pady=20)
         self.main_container.pack(fill=tk.BOTH, expand=True)
-        
+
         # Create a header with app title
         self.header = tk.Frame(self.main_container, bg=DARK_BG, pady=10)
         self.header.pack(fill=tk.X)
-        
+
         self.title_label = tk.Label(
-            self.header, 
-            text="POLAR H10 RECORDER & ANALYZER", 
+            self.header,
+            text="POLAR H10 RECORDER & ANALYZER",
             font=("Segoe UI", 24, "bold"),
             bg=DARK_BG,
             fg=ACCENT_COLOR
         )
         self.title_label.pack()
-        
+
         self.subtitle_label = tk.Label(
             self.header,
             text="Scientific Data Acquisition System",
@@ -75,7 +78,7 @@ class LSLGui:
             fg=SECONDARY_TEXT
         )
         self.subtitle_label.pack(pady=(0, 10))
-        
+
         # Separator
         self.separator = ttk.Separator(self.main_container, orient='horizontal')
         self.separator.pack(fill=tk.X, pady=10)
@@ -83,8 +86,8 @@ class LSLGui:
         # Set up the main frames with modern styling
         self.content_frame = tk.Frame(self.main_container, bg=DARK_BG)
         self.content_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.left_frame = tk.Frame(self.content_frame, bg=DARKER_BG, padx=15, pady=15, 
+
+        self.left_frame = tk.Frame(self.content_frame, bg=DARKER_BG, padx=15, pady=15,
                                   highlightbackground=BORDER_COLOR, highlightthickness=1)
         self.right_frame = tk.Frame(self.content_frame, bg=DARKER_BG, padx=15, pady=15,
                                    highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -95,14 +98,14 @@ class LSLGui:
         # Create the recorder and analyzer components
         self.recorder = PolarStreamRecorder(self.left_frame)
         self.analyzer = LSLDataAnalyzer(self.right_frame)
-        
+
         # Set up window close handler
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
+
     def configure_theme(self):
         """Configure the ttk theme for a modern look"""
         style = ttk.Style()
-        
+
         # Configure TButton style
         style.configure(
             "TButton",
@@ -113,7 +116,7 @@ class LSLGui:
             focuscolor=ACCENT_COLOR,
             padding=(10, 5)
         )
-        
+
         # Configure TCombobox style
         style.configure(
             "TCombobox",
@@ -124,7 +127,7 @@ class LSLGui:
             borderwidth=1,
             padding=5
         )
-        
+
         # Configure TEntry style
         style.configure(
             "TEntry",
@@ -133,7 +136,7 @@ class LSLGui:
             borderwidth=1,
             padding=5
         )
-        
+
         # Configure TScrollbar style
         style.configure(
             "TScrollbar",
@@ -142,20 +145,20 @@ class LSLGui:
             borderwidth=0,
             arrowsize=13
         )
-        
+
     def on_closing(self):
         """Handle window closing event"""
         try:
-            # Disconnect from device if connected
             if hasattr(self.recorder, 'connected') and self.recorder.connected:
+                self.recorder._disconnect_done.clear()
                 self.recorder.disconnect_from_device()
-                
-            # Wait a moment for disconnection to complete
-            time.sleep(0.5)
+                self.recorder._disconnect_done.wait(timeout=5.0)
         except Exception as e:
             print(f"Error during shutdown: {str(e)}")
         finally:
-            # Destroy the window
+            # Stop the event loop
+            if hasattr(self.recorder, 'loop') and self.recorder.loop.is_running():
+                self.recorder.loop.call_soon_threadsafe(self.recorder.loop.stop)
             self.master.destroy()
 
 
@@ -171,20 +174,27 @@ class PolarStreamRecorder:
         self.client = None
         self.device_address = None
         self.data_buffers = {
-            'HeartRate': [],
-            'RRinterval': []
+            'HeartRate': deque(maxlen=1000),
+            'RRinterval': deque(maxlen=1000),
+            'RawECG': deque(maxlen=5000),
         }
+        self.acc_buffer = deque(maxlen=5000)  # Stores (timestamp, x, y, z) tuples
         self.marked_timestamps = []
         self.intervals = []  # Store completed intervals as (start, end) pairs
         self.current_interval_start = None  # Track if we're in the middle of creating an interval
         self.participant_folder = None
         self.current_participant_id = None  # Track current participant ID
         self.loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
+        self._loop_thread.start()
+        self._disconnect_done = threading.Event()
         self.plot_update_scheduled = False  # Flag to track if plot updates are scheduled
-        
+
         # LSL streaming
         self.hr_outlet = None
         self.rr_outlet = None
+        self.ecg_outlet = None
+        self.acc_outlet = None
 
         # Create a status label
         self.status_var = tk.StringVar()
@@ -194,18 +204,20 @@ class PolarStreamRecorder:
 
         self.setup_ui()
 
-
+    def _run_event_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
 
     def setup_ui(self):
         # Section title with icon-like prefix
         title_frame = tk.Frame(self.parent, bg=DARKER_BG)
         title_frame.pack(fill=tk.X, pady=(0, 15))
-        
+
         section_title = tk.Label(
-            title_frame, 
-            text="◉ RECORDING MODULE", 
-            font=("Segoe UI", 16, "bold"), 
-            fg=ACCENT_COLOR, 
+            title_frame,
+            text="◉ RECORDING MODULE",
+            font=("Segoe UI", 16, "bold"),
+            fg=ACCENT_COLOR,
             bg=DARKER_BG,
             anchor="w"
         )
@@ -214,23 +226,23 @@ class PolarStreamRecorder:
         # Participant ID section with modern styling
         participant_frame = tk.Frame(self.parent, bg=DARKER_BG, pady=10)
         participant_frame.pack(fill=tk.X)
-        
+
         self.participant_id_label = tk.Label(
-            participant_frame, 
-            text="PARTICIPANT ID", 
-            font=("Segoe UI", 10), 
-            bg=DARKER_BG, 
+            participant_frame,
+            text="PARTICIPANT ID",
+            font=("Segoe UI", 10),
+            bg=DARKER_BG,
             fg=SECONDARY_TEXT,
             anchor="w"
         )
         self.participant_id_label.pack(fill=tk.X)
-        
+
         # Entry and button container
         id_input_frame = tk.Frame(participant_frame, bg=DARKER_BG)
         id_input_frame.pack(fill=tk.X, pady=(5, 0))
-        
+
         self.participant_id_entry = tk.Entry(
-            id_input_frame, 
+            id_input_frame,
             font=("Segoe UI", 14),
             bg=DARK_BG,
             fg=TEXT_COLOR,
@@ -240,13 +252,13 @@ class PolarStreamRecorder:
             highlightthickness=1
         )
         self.participant_id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
+
         # Bind Enter key to set participant ID
         self.participant_id_entry.bind('<Return>', lambda event: self.set_participant_id())
-        
+
         self.set_id_button = tk.Button(
-            id_input_frame, 
-            text="SET ID", 
+            id_input_frame,
+            text="SET ID",
             font=("Segoe UI", 10, "bold"),
             bg=ACCENT_COLOR,
             fg=DARKER_BG,
@@ -258,7 +270,7 @@ class PolarStreamRecorder:
             command=self.set_participant_id
         )
         self.set_id_button.pack(side=tk.RIGHT, padx=(10, 0))
-        
+
         # Current session indicator
         self.session_status_label = tk.Label(
             participant_frame,
@@ -275,10 +287,10 @@ class PolarStreamRecorder:
         self.device_frame.pack(fill=tk.X)
 
         self.device_label = tk.Label(
-            self.device_frame, 
-            text="POLAR DEVICE", 
-            font=("Segoe UI", 10), 
-            bg=DARKER_BG, 
+            self.device_frame,
+            text="POLAR DEVICE",
+            font=("Segoe UI", 10),
+            bg=DARKER_BG,
             fg=SECONDARY_TEXT,
             anchor="w"
         )
@@ -286,20 +298,20 @@ class PolarStreamRecorder:
 
         device_selection_frame = tk.Frame(self.device_frame, bg=DARKER_BG)
         device_selection_frame.pack(fill=tk.X)
-        
+
         self.device_var = tk.StringVar()
         self.device_dropdown = ttk.Combobox(
-            device_selection_frame, 
-            textvariable=self.device_var, 
-            state="readonly", 
-            font=("Segoe UI", 12), 
+            device_selection_frame,
+            textvariable=self.device_var,
+            state="readonly",
+            font=("Segoe UI", 12),
             width=30
         )
         self.device_dropdown.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.scan_button = tk.Button(
-            device_selection_frame, 
-            text="SCAN", 
+            device_selection_frame,
+            text="SCAN",
             font=("Segoe UI", 10, "bold"),
             bg=ACCENT_COLOR,
             fg=DARKER_BG,
@@ -315,10 +327,10 @@ class PolarStreamRecorder:
         # Action buttons with modern styling
         button_frame = tk.Frame(self.parent, bg=DARKER_BG, pady=10)
         button_frame.pack(fill=tk.X)
-        
+
         self.connect_button = tk.Button(
-            button_frame, 
-            text="CONNECT", 
+            button_frame,
+            text="CONNECT",
             font=("Segoe UI", 12, "bold"),
             bg=ACCENT_COLOR,
             fg=DARKER_BG,
@@ -332,8 +344,8 @@ class PolarStreamRecorder:
         self.connect_button.pack(fill=tk.X, pady=5)
 
         self.start_button = tk.Button(
-            button_frame, 
-            text="START RECORDING", 
+            button_frame,
+            text="START RECORDING",
             font=("Segoe UI", 12, "bold"),
             bg=DARK_BG,
             fg=TEXT_COLOR,
@@ -348,8 +360,8 @@ class PolarStreamRecorder:
         self.start_button.pack(fill=tk.X, pady=5)
 
         self.mark_button = tk.Button(
-            button_frame, 
-            text="MARK TIMESTAMP", 
+            button_frame,
+            text="MARK TIMESTAMP",
             font=("Segoe UI", 12, "bold"),
             bg=DARK_BG,
             fg=TEXT_COLOR,
@@ -368,8 +380,8 @@ class PolarStreamRecorder:
         interval_frame.pack(fill=tk.X, pady=5)
 
         self.start_interval_button = tk.Button(
-            interval_frame, 
-            text="START INTERVAL", 
+            interval_frame,
+            text="START INTERVAL",
             font=("Segoe UI", 10, "bold"),
             bg=DARK_BG,
             fg=TEXT_COLOR,
@@ -384,8 +396,8 @@ class PolarStreamRecorder:
         self.start_interval_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
 
         self.end_interval_button = tk.Button(
-            interval_frame, 
-            text="END INTERVAL", 
+            interval_frame,
+            text="END INTERVAL",
             font=("Segoe UI", 10, "bold"),
             bg=DARK_BG,
             fg=TEXT_COLOR,
@@ -402,11 +414,11 @@ class PolarStreamRecorder:
         # Status indicator with modern styling
         status_frame = tk.Frame(self.parent, bg=DARKER_BG, pady=5)
         status_frame.pack(fill=tk.X)
-        
+
         self.status_label = tk.Label(
-            status_frame, 
-            textvariable=self.status_var, 
-            font=("Segoe UI", 10), 
+            status_frame,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10),
             bg=DARKER_BG,
             fg=SECONDARY_TEXT,
             anchor="w"
@@ -419,23 +431,23 @@ class PolarStreamRecorder:
         plt.style.use('dark_background')
         self.figure, self.ax1 = plt.subplots(figsize=(8, 4))
         self.figure.patch.set_facecolor(DARKER_BG)
-        
+
         self.ax1.set_facecolor(DARK_BG)
         self.ax1.tick_params(colors=SECONDARY_TEXT)
         self.ax1.spines['bottom'].set_color(BORDER_COLOR)
-        self.ax1.spines['top'].set_color(BORDER_COLOR) 
+        self.ax1.spines['top'].set_color(BORDER_COLOR)
         self.ax1.spines['right'].set_color(BORDER_COLOR)
         self.ax1.spines['left'].set_color(BORDER_COLOR)
-        
+
         self.ax2 = self.ax1.twinx()  # Create a second y-axis
         self.ax2.tick_params(colors=SECONDARY_TEXT)
         self.ax2.spines['bottom'].set_color(BORDER_COLOR)
-        self.ax2.spines['top'].set_color(BORDER_COLOR) 
+        self.ax2.spines['top'].set_color(BORDER_COLOR)
         self.ax2.spines['right'].set_color(BORDER_COLOR)
         self.ax2.spines['left'].set_color(BORDER_COLOR)
-        
+
         self.figure.suptitle("Live HR & RR Data", fontsize=14, color=TEXT_COLOR)
-        
+
         # Add a grid with low opacity
         self.ax1.grid(True, linestyle='--', alpha=0.2)
 
@@ -451,15 +463,20 @@ class PolarStreamRecorder:
 
     def _scan_devices_thread(self):
         try:
-            devices = self.loop.run_until_complete(self._scan_for_polar_devices())
-            self.device_dropdown['values'] = devices
-            if devices:
-                self.device_dropdown.current(0)
-            messagebox.showinfo("Scan Complete", f"Found {len(devices)} Polar devices")
+            future = asyncio.run_coroutine_threadsafe(self._scan_for_polar_devices(), self.loop)
+            devices = future.result()
+            self.parent.after(0, lambda d=devices: self._scan_devices_done(d))
         except Exception as e:
-            messagebox.showerror("Scan Error", f"Error scanning for devices: {str(e)}")
-        finally:
-            self.scan_button.config(text="Scan", state=tk.NORMAL)
+            err = str(e)
+            self.parent.after(0, lambda msg=err: messagebox.showerror("Scan Error", f"Error scanning for devices: {msg}"))
+            self.parent.after(0, lambda: self.scan_button.config(text="SCAN", state=tk.NORMAL))
+
+    def _scan_devices_done(self, devices):
+        self.device_dropdown['values'] = devices
+        if devices:
+            self.device_dropdown.current(0)
+        messagebox.showinfo("Scan Complete", f"Found {len(devices)} Polar devices")
+        self.scan_button.config(text="SCAN", state=tk.NORMAL)
 
     async def _scan_for_polar_devices(self):
         devices = []
@@ -475,26 +492,26 @@ class PolarStreamRecorder:
     def set_participant_id(self):
         """Set or change the participant ID and start a new session"""
         new_id = self.participant_id_entry.get().strip()
-        
+
         if not new_id:
             messagebox.showwarning("Invalid ID", "Please enter a valid Participant ID.")
             return
-            
+
         # Check if this is the same as current ID
         if new_id == self.current_participant_id:
             return
-            
+
         # Check if recording is active
         if self.recording:
             response = messagebox.askyesnocancel(
-                "Recording in Progress", 
+                "Recording in Progress",
                 f"A recording is currently active for participant '{self.current_participant_id}'.\n\n"
                 f"Do you want to:\n"
                 f"• Yes: Stop current recording and start new session for '{new_id}'\n"
                 f"• No: Continue current recording\n"
                 f"• Cancel: Abort changing participant ID"
             )
-            
+
             if response is None:  # Cancel
                 # Reset entry to current ID
                 if self.current_participant_id:
@@ -515,18 +532,18 @@ class PolarStreamRecorder:
         else:
             # No recording active, check for existing data and start new session
             self._check_existing_data_and_start_session(new_id)
-            
+
     def _check_existing_data_and_start_session(self, participant_id):
         """Check if participant data already exists and handle accordingly"""
         participant_folder = os.path.join("Participant_Data", f"Participant_{participant_id}")
-        
+
         # Check if participant folder exists and contains data files
         existing_files = self._get_existing_recording_files(participant_folder)
-        
+
         if existing_files:
             # Show detailed information about existing files
             file_info = self._get_file_info(existing_files)
-            
+
             response = messagebox.askyesnocancel(
                 "Existing Data Found",
                 f"Participant '{participant_id}' already has recorded data:\n\n"
@@ -536,7 +553,7 @@ class PolarStreamRecorder:
                 f"• No: Enter a different participant ID\n"
                 f"• Cancel: Keep current session"
             )
-            
+
             if response is None:  # Cancel
                 # Reset entry to current ID
                 if self.current_participant_id:
@@ -553,7 +570,7 @@ class PolarStreamRecorder:
                     f"This action CANNOT be undone!\n\n"
                     f"Are you absolutely sure you want to proceed?"
                 )
-                
+
                 if response_confirm:
                     try:
                         # Delete existing data files
@@ -561,7 +578,7 @@ class PolarStreamRecorder:
                         print(f"Deleted existing data for participant '{participant_id}'")
                         self.start_new_session(participant_id)
                     except Exception as e:
-                        messagebox.showerror("Error Deleting Data", 
+                        messagebox.showerror("Error Deleting Data",
                                            f"Failed to delete existing data:\n{str(e)}")
                         # Reset entry
                         if self.current_participant_id:
@@ -584,66 +601,68 @@ class PolarStreamRecorder:
         else:
             # No existing data, proceed with new session
             self.start_new_session(participant_id)
-            
+
     def _get_existing_recording_files(self, participant_folder):
         """Get list of existing recording files for a participant"""
         if not os.path.exists(participant_folder):
             return []
-            
+
         recording_files = []
         potential_files = [
             "HeartRate_recording.csv",
-            "RRinterval_recording.csv", 
+            "RRinterval_recording.csv",
+            "RawECG_recording.csv",
+            "Accelerometer_recording.csv",
             "marked_timestamps.csv",
             "intervals.csv"
         ]
-        
+
         for filename in potential_files:
             file_path = os.path.join(participant_folder, filename)
             if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                 recording_files.append(file_path)
-                
+
         return recording_files
-        
+
     def _get_file_info(self, file_paths):
         """Get readable information about existing files"""
         if not file_paths:
             return "No files found"
-            
+
         info_lines = []
         for file_path in file_paths:
             filename = os.path.basename(file_path)
             file_size = os.path.getsize(file_path)
-            
+
             # Get creation/modification time
             mod_time = os.path.getmtime(file_path)
             mod_date = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
-            
+
             # Count lines for CSV files
             if filename.endswith('.csv'):
                 try:
                     with open(file_path, 'r') as f:
                         line_count = sum(1 for line in f) - 1  # Subtract header
                     info_lines.append(f"• {filename}: {line_count} data points ({file_size} bytes, {mod_date})")
-                except:
+                except Exception:
                     info_lines.append(f"• {filename}: {file_size} bytes ({mod_date})")
             else:
                 info_lines.append(f"• {filename}: {file_size} bytes ({mod_date})")
-                
+
         return "\n".join(info_lines)
-        
+
     def _delete_existing_data(self, participant_folder):
         """Delete all existing data for a participant"""
         if not os.path.exists(participant_folder):
             return
-            
+
         # Delete all files in the participant folder
         for filename in os.listdir(participant_folder):
             file_path = os.path.join(participant_folder, filename)
             if os.path.isfile(file_path):
                 os.remove(file_path)
                 print(f"Deleted: {file_path}")
-                
+
         # Remove the empty directory
         try:
             os.rmdir(participant_folder)
@@ -656,17 +675,17 @@ class PolarStreamRecorder:
         """Start a new session with the given participant ID"""
         # Reset all session data
         self.reset_session_data()
-        
+
         # Set new participant ID
         self.current_participant_id = participant_id
         self.participant_folder = os.path.join("Participant_Data", f"Participant_{participant_id}")
-        
+
         # Update UI
         self.session_status_label.config(
             text=f"Active session: {participant_id}",
             fg=SUCCESS_COLOR
         )
-        
+
         # Check folder permissions
         if not self._check_folder_permissions():
             # Reset if folder check fails
@@ -677,28 +696,30 @@ class PolarStreamRecorder:
                 fg=SECONDARY_TEXT
             )
             return False
-            
+
         # Create folder if it doesn't exist
         os.makedirs(self.participant_folder, exist_ok=True)
-        
+
         print(f"Started new session for participant: {participant_id}")
         print(f"Data will be saved to: {self.participant_folder}")
-        
+
         return True
-        
+
     def reset_session_data(self):
         """Reset all session-related data"""
         # Clear data buffers
         self.data_buffers = {
-            'HeartRate': [],
-            'RRinterval': []
+            'HeartRate': deque(maxlen=1000),
+            'RRinterval': deque(maxlen=1000),
+            'RawECG': deque(maxlen=5000),
         }
-        
+        self.acc_buffer = deque(maxlen=5000)
+
         # Clear timestamps and intervals
         self.marked_timestamps = []
         self.intervals = []
         self.current_interval_start = None
-        
+
         # Reset interval button states if they exist
         if hasattr(self, 'start_interval_button'):
             self.start_interval_button.config(
@@ -711,14 +732,14 @@ class PolarStreamRecorder:
                 bg=DARK_BG,
                 fg=TEXT_COLOR if self.connected else SECONDARY_TEXT
             )
-        
+
         # Close any open file handles
         self._close_recording_files()
-        
+
         # Ensure recording UI is reset
         if hasattr(self, 'start_button'):
             self._update_recording_ui_state(False)
-        
+
         print("Session data reset")
 
     def connect_to_device(self):
@@ -804,91 +825,94 @@ class PolarStreamRecorder:
     def _connect_thread(self):
         try:
             # Update button appearance for connecting state
-            self.connect_button.config(
-                text="CONNECTING...", 
+            self.parent.after(0, lambda: self.connect_button.config(
+                text="CONNECTING...",
                 state=tk.DISABLED,
                 bg=WARNING_COLOR,
                 fg=DARKER_BG
-            )
-            
-            self.loop.run_until_complete(self._connect_to_polar())
-            
+            ))
+
+            future = asyncio.run_coroutine_threadsafe(self._connect_to_polar(), self.loop)
+            future.result()
+
             # Enable recording button and mark button with dark theme styling
-            self.start_button.config(
+            self.parent.after(0, lambda: self.start_button.config(
                 state=tk.NORMAL,
                 bg=DARK_BG,
                 fg=TEXT_COLOR,
                 activebackground=DARKER_BG,
                 activeforeground=TEXT_COLOR
-            )
-            
-            self.mark_button.config(
+            ))
+
+            self.parent.after(0, lambda: self.mark_button.config(
                 state=tk.NORMAL,
                 bg=DARK_BG,
                 fg=TEXT_COLOR,
                 activebackground=DARKER_BG,
                 activeforeground=TEXT_COLOR
-            )
-            
+            ))
+
             # Enable interval buttons
-            self.start_interval_button.config(
+            self.parent.after(0, lambda: self.start_interval_button.config(
                 state=tk.NORMAL,
                 bg=DARK_BG,
                 fg=TEXT_COLOR,
                 activebackground=DARKER_BG,
                 activeforeground=TEXT_COLOR
-            )
-            
-            self.end_interval_button.config(
+            ))
+
+            self.parent.after(0, lambda: self.end_interval_button.config(
                 state=tk.NORMAL,
                 bg=DARK_BG,
                 fg=TEXT_COLOR,
                 activebackground=DARKER_BG,
                 activeforeground=TEXT_COLOR
-            )
-            
+            ))
+
             # Update connect button to disconnect button with dark theme styling
-            self.connect_button.config(
-                text="DISCONNECT", 
+            self.parent.after(0, lambda: self.connect_button.config(
+                text="DISCONNECT",
                 state=tk.NORMAL,
                 command=self.disconnect_from_device,
                 bg=ERROR_COLOR,
                 fg=DARKER_BG,
                 activebackground=DARK_BG,
                 activeforeground=ERROR_COLOR
-            )
+            ))
 
             # Start a periodic data request to ensure preview data is continuously received
             threading.Thread(target=self._periodic_data_request, daemon=True).start()
-            
+
             # Update session status
             if self.current_participant_id:
-                self.session_status_label.config(
-                    text=f"Session: {self.current_participant_id} (connected)",
+                pid = self.current_participant_id
+                self.parent.after(0, lambda p=pid: self.session_status_label.config(
+                    text=f"Session: {p} (connected)",
                     fg=SUCCESS_COLOR
-                )
-            
+                ))
+
             # Set up LSL streams for real-time streaming
-            self._setup_lsl_streams()
+            self.parent.after(0, self._setup_lsl_streams)
 
             # Start updating the plot immediately
-            self.update_plot()
+            self.parent.after(0, self.update_plot)
             # Schedule regular plot updates
-            self._schedule_plot_updates()
+            self.parent.after(0, self._schedule_plot_updates)
 
-            messagebox.showinfo("Connected", "Connected to Polar H10 successfully! Data preview and LSL streaming have started automatically.")
+            self.parent.after(0, lambda: messagebox.showinfo("Connected", "Connected to Polar H10 successfully! Data preview and LSL streaming have started automatically."))
         except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed to connect: {str(e)}")
+            err = str(e)
+            self.parent.after(0, lambda msg=err: messagebox.showerror("Connection Error", f"Failed to connect: {msg}"))
             # Reset connect button with dark theme styling
-            self.connect_button.config(
-                text="CONNECT", 
+            self.parent.after(0, lambda: self.connect_button.config(
+                text="CONNECT",
                 state=tk.NORMAL,
                 bg=ACCENT_COLOR,
                 fg=DARKER_BG,
                 activebackground=DARK_BG,
                 activeforeground=ACCENT_COLOR
-            )
-            
+            ))
+
     def _schedule_plot_updates(self):
         """Schedule regular plot updates"""
         if self.connected:
@@ -897,18 +921,40 @@ class PolarStreamRecorder:
             self.parent.after(500, self._schedule_plot_updates)
 
     def _setup_lsl_streams(self):
-        """Set up LSL streams for heart rate and RR intervals"""
+        """Set up LSL streams for heart rate, RR intervals, raw ECG, and accelerometer"""
         try:
             # Create HeartRate stream
             hr_info = StreamInfo('HeartRate', 'ExciteOMeter', 1, 10, 'float32', 'HeartRateStream')
             self.hr_outlet = StreamOutlet(hr_info)
             print("✓ Created LSL stream: HeartRate")
-            
-            # Create RRinterval stream  
+
+            # Create RRinterval stream
             rr_info = StreamInfo('RRinterval', 'ExciteOMeter', 1, 10, 'float32', 'RRintervalStream')
             self.rr_outlet = StreamOutlet(rr_info)
             print("✓ Created LSL stream: RRinterval")
-            
+
+            # Create RawECG stream (130 Hz, single channel, microvolts)
+            ecg_info = StreamInfo('RawECG', 'ECG', 1, 130, 'int32', 'RawECGStream')
+            ecg_info.desc().append_child_value("manufacturer", "Polar")
+            ecg_ch = ecg_info.desc().append_child("channels").append_child("channel")
+            ecg_ch.append_child_value("name", "ECG")
+            ecg_ch.append_child_value("unit", "microvolts")
+            ecg_ch.append_child_value("type", "ECG")
+            self.ecg_outlet = StreamOutlet(ecg_info, 74, 360)
+            print("✓ Created LSL stream: RawECG")
+
+            # Create Accelerometer stream (200 Hz, 3 channels: X, Y, Z, in mg)
+            acc_info = StreamInfo('Accelerometer', 'ACC', 3, 200, 'float32', 'AccelerometerStream')
+            acc_info.desc().append_child_value("manufacturer", "Polar")
+            acc_channels = acc_info.desc().append_child("channels")
+            for axis in ["X", "Y", "Z"]:
+                ch = acc_channels.append_child("channel")
+                ch.append_child_value("name", f"ACC_{axis}")
+                ch.append_child_value("unit", "mg")
+                ch.append_child_value("type", "Accelerometer")
+            self.acc_outlet = StreamOutlet(acc_info, 50, 360)
+            print("✓ Created LSL stream: Accelerometer")
+
         except Exception as e:
             print(f"Error setting up LSL streams: {str(e)}")
 
@@ -921,14 +967,30 @@ class PolarStreamRecorder:
                 print("✓ Cleaned up HeartRate LSL stream")
             except Exception as e:
                 print(f"Error cleaning up HR LSL stream: {str(e)}")
-                
+
         if self.rr_outlet:
             try:
-                del self.rr_outlet  
+                del self.rr_outlet
                 self.rr_outlet = None
                 print("✓ Cleaned up RRinterval LSL stream")
             except Exception as e:
                 print(f"Error cleaning up RR LSL stream: {str(e)}")
+
+        if self.ecg_outlet:
+            try:
+                del self.ecg_outlet
+                self.ecg_outlet = None
+                print("✓ Cleaned up RawECG LSL stream")
+            except Exception as e:
+                print(f"Error cleaning up ECG LSL stream: {str(e)}")
+
+        if self.acc_outlet:
+            try:
+                del self.acc_outlet
+                self.acc_outlet = None
+                print("✓ Cleaned up Accelerometer LSL stream")
+            except Exception as e:
+                print(f"Error cleaning up ACC LSL stream: {str(e)}")
 
     def _periodic_data_request(self):
         """Periodically request data to ensure continuous data flow"""
@@ -960,9 +1022,9 @@ class PolarStreamRecorder:
 
             # Use a longer timeout for connection
             self.client = BleakClient(self.device_address, timeout=20.0)
-            connected = await self.client.connect()
+            await self.client.connect()
 
-            if not connected or not self.client.is_connected:
+            if not self.client.is_connected:
                 raise Exception("Failed to connect to device")
 
             self.connected = True
@@ -972,7 +1034,7 @@ class PolarStreamRecorder:
             # Get device info and services
             try:
                 services = await self.client.get_services()
-                print(f"Available services:")
+                print("Available services:")
                 for service in services.services.values():
                     print(f"Service: {service.uuid}")
                     for char in service.characteristics:
@@ -1052,12 +1114,19 @@ class PolarStreamRecorder:
                     print(f"Alternative approach also failed: {str(e2)}")
                     print("Please ensure the Polar H10 is properly worn and the chest strap is moistened")
 
-            # Enable ECG streaming (for RR intervals) - optional, don't fail if this doesn't work
+            # Enable PMD streams for raw ECG and accelerometer
             try:
                 print("Setting up PMD data notifications...")
-                await self.client.write_gatt_char(PMD_CONTROL, PMD_COMMAND)
                 await self.client.start_notify(PMD_DATA, self._pmd_data_handler)
                 print("PMD data notifications enabled")
+
+                # Start raw ECG stream (130 Hz)
+                await self.client.write_gatt_char(PMD_CONTROL, ECG_WRITE, response=True)
+                print("Started raw ECG stream (130 Hz)")
+
+                # Start accelerometer stream (200 Hz, ±8g)
+                await self.client.write_gatt_char(PMD_CONTROL, ACC_WRITE, response=True)
+                print("Started accelerometer stream (200 Hz)")
             except Exception as e:
                 print(f"Error setting up PMD data: {str(e)}")
                 print("RR intervals may still be available from the heart rate service")
@@ -1076,7 +1145,8 @@ class PolarStreamRecorder:
             time.sleep(2)  # Wait for notifications to be set up
             if not self.data_buffers['HeartRate']:
                 print("No heart rate data received yet, forcing a reading...")
-                self.loop.run_until_complete(self._force_heart_rate_reading_loop())
+                future = asyncio.run_coroutine_threadsafe(self._force_heart_rate_reading_loop(), self.loop)
+                future.result()
         except Exception as e:
             print(f"Error forcing initial reading: {str(e)}")
 
@@ -1105,14 +1175,6 @@ class PolarStreamRecorder:
             except Exception as e:
                 print(f"Error reading battery: {str(e)}")
 
-            # Try writing to the control characteristic to wake up the device
-            try:
-                # Write a dummy value to the control characteristic
-                await self.client.write_gatt_char(PMD_CONTROL, bytearray([0x01, 0x00]))
-                print("Wrote to control characteristic to wake up device")
-            except Exception as e:
-                print(f"Error writing to control: {str(e)}")
-
         except Exception as e:
             print(f"Error in force heart rate reading loop: {str(e)}")
 
@@ -1136,13 +1198,11 @@ class PolarStreamRecorder:
                 print(f"Error forcing heart rate reading: {str(e)}")
 
         # Check every 15 seconds if data is still coming in (increased from 10 to reduce false warnings)
-        last_check_time = time.time()
         last_data_count = len(self.data_buffers['HeartRate'])
         consecutive_no_data = 0  # Count consecutive checks with no new data
 
         while self.connected:
             time.sleep(15)  # Increased from 10 seconds
-            current_time = time.time()
             current_data_count = len(self.data_buffers['HeartRate'])
 
             if current_data_count == last_data_count:
@@ -1168,7 +1228,6 @@ class PolarStreamRecorder:
                 # Data is coming in
                 self.data_received = True
                 last_data_count = current_data_count
-                last_check_time = current_time
                 consecutive_no_data = 0  # Reset counter
 
                 # If we're getting data but not recording, remind the user
@@ -1214,11 +1273,6 @@ class PolarStreamRecorder:
                 except Exception as e:
                     print(f"Error pushing HR to LSL stream: {str(e)}")
 
-            # Limit buffer size to prevent memory issues
-            if len(self.data_buffers['HeartRate']) > 1000:
-                # Keep only the most recent 1000 points
-                self.data_buffers['HeartRate'] = self.data_buffers['HeartRate'][-1000:]
-
             # If first data point, log it
             if len(self.data_buffers['HeartRate']) == 1:
                 print(f"First heart rate data received: {hr_value} bpm")
@@ -1231,10 +1285,8 @@ class PolarStreamRecorder:
             # Check for RR intervals
             if has_rr:
                 # RR intervals are in 1/1024 second format
-                rr_count = (len(data) - 2) // 2  # Each RR interval is 2 bytes
-                rr_offset = 2
-                if hr_format:
-                    rr_offset = 3  # RR values start after the 2-byte heart rate value
+                rr_offset = 3 if hr_format else 2
+                rr_count = (len(data) - rr_offset) // 2  # Each RR interval is 2 bytes
 
                 for i in range(rr_count):
                     rr_value = struct.unpack('<H', data[rr_offset + i*2:rr_offset + i*2 + 2])[0]
@@ -1250,10 +1302,6 @@ class PolarStreamRecorder:
                             self.rr_outlet.push_sample([float(rr_ms)])
                         except Exception as e:
                             print(f"Error pushing RR to LSL stream: {str(e)}")
-
-                    # Limit buffer size
-                    if len(self.data_buffers['RRinterval']) > 1000:
-                        self.data_buffers['RRinterval'] = self.data_buffers['RRinterval'][-1000:]
 
                     # Only save to file if recording
                     if self.recording:
@@ -1294,7 +1342,7 @@ class PolarStreamRecorder:
                 try:
                     self._hr_file.close()
                     self._hr_file = None
-                except:
+                except Exception:
                     pass
 
     def _write_rr_data_to_file(self, timestamp, rr_value):
@@ -1328,30 +1376,127 @@ class PolarStreamRecorder:
                 try:
                     self._rr_file.close()
                     self._rr_file = None
-                except:
+                except Exception:
+                    pass
+
+    def _write_ecg_data_to_file(self, timestamp, ecg_value):
+        """Write raw ECG sample to file"""
+        try:
+            if not hasattr(self, '_ecg_file') or self._ecg_file is None:
+                csv_filename = os.path.join(self.participant_folder, "RawECG_recording.csv")
+                if not os.path.exists(csv_filename):
+                    os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
+                    with open(csv_filename, 'w', newline='') as f:
+                        csv.writer(f).writerow(['Timestamp', 'Value'])
+                self._ecg_file = open(csv_filename, 'a', newline='')
+                self._ecg_writer = csv.writer(self._ecg_file)
+                print(f"Opened ECG file for writing: {csv_filename}")
+            self._ecg_writer.writerow([timestamp, ecg_value])
+            self._ecg_file.flush()
+        except Exception as e:
+            print(f"Error writing ECG data to file: {str(e)}")
+            if hasattr(self, '_ecg_file') and self._ecg_file is not None:
+                try:
+                    self._ecg_file.close()
+                    self._ecg_file = None
+                except Exception:
+                    pass
+
+    def _write_acc_data_to_file(self, timestamp, x, y, z):
+        """Write accelerometer sample to file"""
+        try:
+            if not hasattr(self, '_acc_file') or self._acc_file is None:
+                csv_filename = os.path.join(self.participant_folder, "Accelerometer_recording.csv")
+                if not os.path.exists(csv_filename):
+                    os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
+                    with open(csv_filename, 'w', newline='') as f:
+                        csv.writer(f).writerow(['Timestamp', 'X_mg', 'Y_mg', 'Z_mg'])
+                self._acc_file = open(csv_filename, 'a', newline='')
+                self._acc_writer = csv.writer(self._acc_file)
+                print(f"Opened ACC file for writing: {csv_filename}")
+            self._acc_writer.writerow([timestamp, x, y, z])
+            self._acc_file.flush()
+        except Exception as e:
+            print(f"Error writing ACC data to file: {str(e)}")
+            if hasattr(self, '_acc_file') and self._acc_file is not None:
+                try:
+                    self._acc_file.close()
+                    self._acc_file = None
+                except Exception:
                     pass
 
     def _pmd_data_handler(self, sender, data):
-        """Handle PMD data (ECG and other raw data)"""
-        # This is a simplified handler - full implementation would parse the PMD data format
-        # For now, we're focusing on heart rate and RR intervals from the standard BLE service
-        pass
+        """Handle PMD data — parses raw ECG (type 0x00) and accelerometer (type 0x02) frames."""
+        if not data or len(data) < 10:
+            return
+
+        measurement_type = data[0]
+        timestamp = local_clock()
+
+        try:
+            if measurement_type == 0x00:
+                # --- Raw ECG ---
+                # Samples start at byte 10, 3 bytes each, little-endian signed int
+                step = 3
+                samples = data[10:]
+                offset = 0
+                while offset + step <= len(samples):
+                    ecg = int.from_bytes(samples[offset:offset + step], byteorder='little', signed=True)
+                    offset += step
+
+                    # Push to LSL
+                    if self.ecg_outlet:
+                        self.ecg_outlet.push_sample([ecg])
+
+                    # Buffer for file recording
+                    self.data_buffers['RawECG'].append((timestamp, ecg))
+
+                    if self.recording:
+                        self._write_ecg_data_to_file(timestamp, ecg)
+
+            elif measurement_type == 0x02:
+                # --- Accelerometer ---
+                # Samples start at byte 10, 6 bytes each: X, Y, Z as int16 LE
+                # Convert raw int16 to mg: raw * (8000 mg / 32768) for ±8g range
+                SCALE = 8000.0 / 32768.0
+                step = 6
+                samples = data[10:]
+                offset = 0
+                while offset + step <= len(samples):
+                    x = int.from_bytes(samples[offset:offset + 2], byteorder='little', signed=True) * SCALE
+                    y = int.from_bytes(samples[offset + 2:offset + 4], byteorder='little', signed=True) * SCALE
+                    z = int.from_bytes(samples[offset + 4:offset + 6], byteorder='little', signed=True) * SCALE
+                    offset += step
+
+                    # Push to LSL
+                    if self.acc_outlet:
+                        self.acc_outlet.push_sample([x, y, z])
+
+                    # Buffer for file recording
+                    self.acc_buffer.append((timestamp, x, y, z))
+
+                    if self.recording:
+                        self._write_acc_data_to_file(timestamp, x, y, z)
+
+        except Exception as e:
+            print(f"Error in PMD data handler (type {measurement_type:#04x}): {str(e)}")
 
     def toggle_recording(self):
         if not self.recording:
             # Start recording
             try:
-                # Set up recording files
-                threading.Thread(target=self._setup_recording_files, daemon=True).start()
+                # Set up recording files synchronously BEFORE setting recording = True
+                # to avoid race condition where BLE callbacks write before files are ready
+                self._setup_recording_files()
 
                 # Mark the start of recording time
                 self.recording_start_time = local_clock()
                 print(f"Recording start time: {self.recording_start_time}")
 
-                # Set recording flags
+                # Set recording flags AFTER files are ready
                 self.recording = True
                 self.recording_event.set()
-                
+
                 # Update UI to reflect recording started
                 self._update_recording_ui_state(True)
                 print("Recording started successfully")
@@ -1363,7 +1508,7 @@ class PolarStreamRecorder:
                 messagebox.showerror("Recording Error", f"Failed to start recording: {str(e)}")
                 self.recording = False
                 self.recording_event.clear()
-                
+
                 # Reset button appearance
                 self.start_button.config(
                     text="START RECORDING",
@@ -1377,13 +1522,13 @@ class PolarStreamRecorder:
             self.stop_recording()
 
     def _setup_recording_files(self):
-        """Set up recording files in a separate thread"""
+        """Set up recording files synchronously before recording starts"""
         try:
             # Ensure the participant folder exists
             if not os.path.exists(self.participant_folder):
                 os.makedirs(self.participant_folder, exist_ok=True)
 
-            # Create CSV files with headers
+            # Create CSV files with headers for data_buffers streams
             for stream_name in self.data_buffers.keys():
                 csv_filename = os.path.join(self.participant_folder, f"{stream_name}_recording.csv")
                 with open(csv_filename, 'w', newline='') as csvfile:
@@ -1391,13 +1536,20 @@ class PolarStreamRecorder:
                     csv_writer.writerow(['Timestamp', 'Value'])
                 print(f"Created file: {csv_filename}")
 
+            # Create Accelerometer file with correct header (not in data_buffers)
+            acc_filename = os.path.join(self.participant_folder, "Accelerometer_recording.csv")
+            with open(acc_filename, 'w', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow(['Timestamp', 'X_mg', 'Y_mg', 'Z_mg'])
+            print(f"Created file: {acc_filename}")
+
             # Create a file for marked timestamps
             marked_filename = os.path.join(self.participant_folder, "marked_timestamps.csv")
             with open(marked_filename, 'w', newline='') as csvfile:
                 csv_writer = csv.writer(csvfile)
                 csv_writer.writerow(['Timestamp'])
                 print(f"Created file: {marked_filename}")
-                
+
             # Create a file for intervals
             intervals_filename = os.path.join(self.participant_folder, "intervals.csv")
             with open(intervals_filename, 'w', newline='') as csvfile:
@@ -1407,14 +1559,9 @@ class PolarStreamRecorder:
 
             print(f"Recording files created in {self.participant_folder}")
 
-            # Start a thread to monitor recording
-            threading.Thread(target=self._monitor_recording, daemon=True).start()
-
         except Exception as e:
             print(f"Error in setup_recording_files: {str(e)}")
-            # Notify the user of the error
-            self.parent.after(0, lambda: messagebox.showerror("Recording Error", 
-                                                             f"Failed to set up recording files: {str(e)}"))
+            raise
 
     def _monitor_recording(self):
         """Monitor the recording process to ensure data is being saved"""
@@ -1444,10 +1591,10 @@ class PolarStreamRecorder:
         # Store the recording stop time
         self.recording_stop_time = local_clock()
         print(f"Recording stop time: {self.recording_stop_time}")
-        
+
         # Handle incomplete interval
         if self.current_interval_start is not None:
-            response = messagebox.askyesno("Incomplete Interval", 
+            response = messagebox.askyesno("Incomplete Interval",
                                          "You have an active interval. Do you want to end it automatically when stopping recording?")
             if response:
                 self.end_interval()
@@ -1463,10 +1610,10 @@ class PolarStreamRecorder:
                     bg=DARK_BG,
                     fg=TEXT_COLOR
                 )
-        
+
         self.recording = False
         self.recording_event.clear()
-        
+
         # Close file handles if they're open
         self._close_recording_files()
 
@@ -1474,10 +1621,10 @@ class PolarStreamRecorder:
 
         # Verify the recording files
         self._verify_recording_files()
-        
+
         # Update UI to reflect recording stopped
         self._update_recording_ui_state(False)
-        
+
         # Force an immediate plot update to show the stop line
         self.update_plot()
 
@@ -1492,7 +1639,7 @@ class PolarStreamRecorder:
                 activebackground=DARK_BG,
                 activeforeground=ERROR_COLOR
             )
-            
+
             # Update status with recording indicator
             if hasattr(self, 'status_var'):
                 current_status = self.status_var.get()
@@ -1507,7 +1654,7 @@ class PolarStreamRecorder:
                 activebackground=DARKER_BG,
                 activeforeground=TEXT_COLOR
             )
-            
+
             # Update status to remove recording indicator
             if hasattr(self, 'status_var'):
                 current_status = self.status_var.get()
@@ -1535,6 +1682,26 @@ class PolarStreamRecorder:
                 print(f"Error closing RR interval file: {str(e)}")
             finally:
                 self._rr_file = None
+
+        # close ECG file
+        if hasattr(self, '_ecg_file') and self._ecg_file is not None:
+            try:
+                self._ecg_file.close()
+                print("Closed ECG recording file")
+            except Exception as e:
+                print(f"Error closing ECG file: {str(e)}")
+            finally:
+                self._ecg_file = None
+
+        # close ACC file
+        if hasattr(self, '_acc_file') and self._acc_file is not None:
+            try:
+                self._acc_file.close()
+                print("Closed ACC recording file")
+            except Exception as e:
+                print(f"Error closing ACC file: {str(e)}")
+            finally:
+                self._acc_file = None
 
     def _verify_recording_files(self):
         """Verify that the recording files exist and contain data"""
@@ -1572,7 +1739,7 @@ class PolarStreamRecorder:
 
             # Show a summary to the user
             if len(self.data_buffers['HeartRate']) > 0:
-                hr_filename = os.path.join(self.participant_folder, f"HeartRate_recording.csv")
+                hr_filename = os.path.join(self.participant_folder, "HeartRate_recording.csv")
                 if os.path.exists(hr_filename) and os.path.getsize(hr_filename) > 20:
                     messagebox.showinfo("Recording Complete", f"Recording completed successfully.\nData saved to {self.participant_folder}")
                 else:
@@ -1595,13 +1762,13 @@ class PolarStreamRecorder:
         if not self.recording:
             messagebox.showwarning("Recording Not Active", "Start recording before creating intervals.")
             return
-            
+
         if self.current_interval_start is not None:
             messagebox.showwarning("Interval Already Started", "You have already started an interval. End it before starting a new one.")
             return
-            
+
         self.current_interval_start = local_clock()
-        
+
         # Update button states to show interval is active
         self.start_interval_button.config(
             bg=WARNING_COLOR,
@@ -1612,7 +1779,7 @@ class PolarStreamRecorder:
             bg=SUCCESS_COLOR,
             fg=DARKER_BG
         )
-        
+
         messagebox.showinfo("Interval Started", f"Interval started at {self.current_interval_start:.2f}")
         print(f"Interval started at {self.current_interval_start:.2f}")
 
@@ -1620,20 +1787,21 @@ class PolarStreamRecorder:
         if not self.recording:
             messagebox.showwarning("Recording Not Active", "Start recording before creating intervals.")
             return
-            
+
         if self.current_interval_start is None:
             messagebox.showwarning("No Active Interval", "Start an interval before ending it.")
             return
-            
+
         end_time = local_clock()
-        interval_duration = end_time - self.current_interval_start
-        
+        interval_start = self.current_interval_start
+        interval_duration = end_time - interval_start
+
         # Store the completed interval
-        self.intervals.append((self.current_interval_start, end_time))
-        
+        self.intervals.append((interval_start, end_time))
+
         # Reset interval state
         self.current_interval_start = None
-        
+
         # Reset button states
         self.start_interval_button.config(
             bg=DARK_BG,
@@ -1644,10 +1812,10 @@ class PolarStreamRecorder:
             bg=DARK_BG,
             fg=TEXT_COLOR
         )
-        
-        messagebox.showinfo("Interval Completed", 
+
+        messagebox.showinfo("Interval Completed",
                           f"Interval completed!\nDuration: {interval_duration:.2f} seconds\nTotal intervals: {len(self.intervals)}")
-        print(f"Interval completed: {self.current_interval_start:.2f} - {end_time:.2f} (duration: {interval_duration:.2f}s)")
+        print(f"Interval completed: {interval_start:.2f} - {end_time:.2f} (duration: {interval_duration:.2f}s)")
         print(f"Total intervals created: {len(self.intervals)}")
 
     def save_marked_timestamps(self):
@@ -1658,7 +1826,7 @@ class PolarStreamRecorder:
                 csv_writer = csv.writer(marked_file)
                 csv_writer.writerow(['Timestamp'])
                 csv_writer.writerows([[ts] for ts in self.marked_timestamps])
-                
+
         # Save intervals
         if self.intervals:
             intervals_filename = os.path.join(self.participant_folder, "intervals.csv")
@@ -1668,7 +1836,7 @@ class PolarStreamRecorder:
                 for start, end in self.intervals:
                     duration = end - start
                     csv_writer.writerow([start, end, duration])
-                    
+
         # Handle incomplete interval
         if self.current_interval_start is not None:
             print(f"Warning: Incomplete interval detected (started at {self.current_interval_start:.2f})")
@@ -1685,10 +1853,10 @@ class PolarStreamRecorder:
             # Set dark theme styling for the plot
             self.ax1.set_facecolor(DARK_BG)
             self.ax2.set_facecolor(DARK_BG)
-            
+
             self.ax1.tick_params(colors=SECONDARY_TEXT)
             self.ax2.tick_params(colors=SECONDARY_TEXT)
-            
+
             for spine in ['bottom', 'top', 'right', 'left']:
                 self.ax1.spines[spine].set_color(BORDER_COLOR)
                 self.ax2.spines[spine].set_color(BORDER_COLOR)
@@ -1696,7 +1864,7 @@ class PolarStreamRecorder:
             # Plot heart rate data
             if 'HeartRate' in self.data_buffers and self.data_buffers['HeartRate']:
                 # Limit to last 100 seconds of data
-                hr_data = [(ts, val) for ts, val in self.data_buffers['HeartRate'] if current_time - ts <= 100]
+                hr_data = [(ts, val) for ts, val in list(self.data_buffers['HeartRate']) if current_time - ts <= 100]
 
                 if hr_data:
                     # If recording, split data into pre-recording and recording data
@@ -1734,7 +1902,7 @@ class PolarStreamRecorder:
             # Plot RR interval data
             if 'RRinterval' in self.data_buffers and self.data_buffers['RRinterval']:
                 # Limit to last 100 seconds of data
-                rr_data = [(ts, val) for ts, val in self.data_buffers['RRinterval'] if current_time - ts <= 100]
+                rr_data = [(ts, val) for ts, val in list(self.data_buffers['RRinterval']) if current_time - ts <= 100]
 
                 if rr_data:
                     # If recording, split data into pre-recording and recording data
@@ -1782,32 +1950,32 @@ class PolarStreamRecorder:
                 # Create a list of legend handles and labels from both axes
                 handles1, labels1 = self.ax1.get_legend_handles_labels()
                 handles2, labels2 = self.ax2.get_legend_handles_labels()
-                
+
                 # Combine them and create a single legend
                 legend = self.ax1.legend(
-                    handles1 + handles2, 
-                    labels1 + labels2, 
-                    loc='upper left', 
-                    facecolor=DARKER_BG, 
+                    handles1 + handles2,
+                    labels1 + labels2,
+                    loc='upper left',
+                    facecolor=DARKER_BG,
                     edgecolor=BORDER_COLOR
                 )
-                
+
                 for text in legend.get_texts():
                     text.set_color(TEXT_COLOR)
             else:
                 # For preview mode, also show both HR and RR in legend
                 handles1, labels1 = self.ax1.get_legend_handles_labels()
                 handles2, labels2 = self.ax2.get_legend_handles_labels()
-                
+
                 if handles1 or handles2:
                     legend = self.ax1.legend(
-                        handles1 + handles2, 
-                        labels1 + labels2, 
-                        loc='upper left', 
-                        facecolor=DARKER_BG, 
+                        handles1 + handles2,
+                        labels1 + labels2,
+                        loc='upper left',
+                        facecolor=DARKER_BG,
                         edgecolor=BORDER_COLOR
                     )
-                    
+
                     for text in legend.get_texts():
                         text.set_color(TEXT_COLOR)
 
@@ -1815,20 +1983,20 @@ class PolarStreamRecorder:
             if self.recording and hasattr(self, 'recording_start_time'):
                 if current_time - self.recording_start_time <= 100:  # Only if recording start is within view
                     self.ax1.axvline(
-                        x=self.recording_start_time, 
-                        color=SUCCESS_COLOR, 
-                        linestyle='--', 
+                        x=self.recording_start_time,
+                        color=SUCCESS_COLOR,
+                        linestyle='--',
                         alpha=0.8,
                         label='Recording Start'
                     )
-            
+
             # Add a vertical line at recording stop time if available
             if hasattr(self, 'recording_stop_time') and not self.recording:
                 if current_time - self.recording_stop_time <= 100:  # Only if stop time is within view
                     self.ax1.axvline(
-                        x=self.recording_stop_time, 
-                        color=ERROR_COLOR, 
-                        linestyle='--', 
+                        x=self.recording_stop_time,
+                        color=ERROR_COLOR,
+                        linestyle='--',
                         alpha=0.8,
                         label='Recording Stop'
                     )
@@ -1837,13 +2005,13 @@ class PolarStreamRecorder:
             for ts in self.marked_timestamps:
                 if current_time - ts <= 100:  # Only if timestamp is within view
                     self.ax1.axvline(x=ts, color='m', linestyle=':', alpha=0.7, label='Marked Timestamp' if ts == self.marked_timestamps[0] else "")
-                    
+
             # Add completed intervals as shaded regions
             for i, (start, end) in enumerate(self.intervals):
                 if current_time - end <= 100:  # Only if interval end is within view
-                    self.ax1.axvspan(start, end, alpha=0.2, color='cyan', 
+                    self.ax1.axvspan(start, end, alpha=0.2, color='cyan',
                                    label='Completed Intervals' if i == 0 else "")
-                    
+
             # Add current active interval as shaded region
             if self.current_interval_start is not None:
                 if current_time - self.current_interval_start <= 100:  # Only if interval start is within view
@@ -1926,15 +2094,17 @@ class PolarStreamRecorder:
             if preview_mode:
                 try:
                     # Just try to read heart rate directly
-                    hr_value = self.loop.run_until_complete(self._read_heart_rate())
+                    future = asyncio.run_coroutine_threadsafe(self._read_heart_rate(), self.loop)
+                    hr_value = future.result()
                     if hr_value:
                         return
-                except Exception as e:
+                except Exception:
                     # If that fails, continue with standard approach
                     pass
 
             # Standard approach
-            self.loop.run_until_complete(self._force_heart_rate_reading_loop())
+            future = asyncio.run_coroutine_threadsafe(self._force_heart_rate_reading_loop(), self.loop)
+            future.result()
 
             # Wait a moment to see if data arrives
             time.sleep(1 if preview_mode else 2)
@@ -1942,7 +2112,8 @@ class PolarStreamRecorder:
             # If still no data and not in preview mode, try a more aggressive approach
             if not self.data_buffers['HeartRate'] and not preview_mode:
                 print("Standard approach failed. Trying more aggressive methods...")
-                self.loop.run_until_complete(self._aggressive_heart_rate_test())
+                future = asyncio.run_coroutine_threadsafe(self._aggressive_heart_rate_test(), self.loop)
+                future.result()
         except Exception as e:
             print(f"Error in force test reading: {str(e)}")
 
@@ -2037,88 +2208,101 @@ class PolarStreamRecorder:
     def _disconnect_thread(self):
         try:
             # Update button appearance for disconnecting state
-            self.connect_button.config(
-                text="DISCONNECTING...", 
+            self.parent.after(0, lambda: self.connect_button.config(
+                text="DISCONNECTING...",
                 state=tk.DISABLED,
                 bg=WARNING_COLOR,
                 fg=DARKER_BG
-            )
+            ))
 
             if self.client and self.client.is_connected:
-                self.loop.run_until_complete(self._disconnect_from_polar())
+                future = asyncio.run_coroutine_threadsafe(self._disconnect_from_polar(), self.loop)
+                future.result()
 
             self.connected = False
-            
+
             # Disable buttons with dark theme styling
-            self.start_button.config(
+            self.parent.after(0, lambda: self.start_button.config(
                 state=tk.DISABLED,
                 bg=DARK_BG,
                 fg=SECONDARY_TEXT
-            )
-            
-            self.mark_button.config(
+            ))
+
+            self.parent.after(0, lambda: self.mark_button.config(
                 state=tk.DISABLED,
                 bg=DARK_BG,
                 fg=SECONDARY_TEXT
-            )
-            
+            ))
+
             # Disable interval buttons
-            self.start_interval_button.config(
+            self.parent.after(0, lambda: self.start_interval_button.config(
                 state=tk.DISABLED,
                 bg=DARK_BG,
                 fg=SECONDARY_TEXT,
                 text="START INTERVAL"
-            )
-            
-            self.end_interval_button.config(
+            ))
+
+            self.parent.after(0, lambda: self.end_interval_button.config(
                 state=tk.DISABLED,
                 bg=DARK_BG,
                 fg=SECONDARY_TEXT
-            )
-            
+            ))
+
             # Reset interval state
             self.current_interval_start = None
-            
+
             # Update session status if we have one
             if self.current_participant_id:
-                self.session_status_label.config(
-                    text=f"Session: {self.current_participant_id} (disconnected)",
+                pid = self.current_participant_id
+                self.parent.after(0, lambda p=pid: self.session_status_label.config(
+                    text=f"Session: {p} (disconnected)",
                     fg=WARNING_COLOR
-                )
-            
+                ))
+
             # Reset connect button with dark theme styling
-            self.connect_button.config(
-                text="CONNECT", 
-                state=tk.NORMAL, 
+            self.parent.after(0, lambda: self.connect_button.config(
+                text="CONNECT",
+                state=tk.NORMAL,
                 command=self.connect_to_device,
                 bg=ACCENT_COLOR,
                 fg=DARKER_BG,
                 activebackground=DARK_BG,
                 activeforeground=ACCENT_COLOR
-            )
-            
-            self.status_var.set("Status: Disconnected")
-            
+            ))
+
+            self.parent.after(0, lambda: self.status_var.set("Status: Disconnected"))
+
             # Close any open file handles
             self._close_recording_files()
-            
-            messagebox.showinfo("Disconnected", "Disconnected from Polar H10")
+
+            self.parent.after(0, lambda: messagebox.showinfo("Disconnected", "Disconnected from Polar H10"))
         except Exception as e:
-            messagebox.showerror("Disconnection Error", f"Error during disconnection: {str(e)}")
+            err = str(e)
+            self.parent.after(0, lambda msg=err: messagebox.showerror("Disconnection Error", f"Error during disconnection: {msg}"))
             # Reset connect button with dark theme styling
-            self.connect_button.config(
-                text="CONNECT", 
-                state=tk.NORMAL, 
+            self.parent.after(0, lambda: self.connect_button.config(
+                text="CONNECT",
+                state=tk.NORMAL,
                 command=self.connect_to_device,
                 bg=ACCENT_COLOR,
                 fg=DARKER_BG,
                 activebackground=DARK_BG,
                 activeforeground=ACCENT_COLOR
-            )
+            ))
+        finally:
+            self._disconnect_done.set()
 
     async def _disconnect_from_polar(self):
         """Disconnect from the Polar device"""
         if self.client:
+            # Send PMD stop commands before stopping notifications
+            try:
+                await self.client.write_gatt_char(PMD_CONTROL, bytearray([0x03, 0x00]), response=True)  # stop ECG
+                await self.client.write_gatt_char(PMD_CONTROL, bytearray([0x03, 0x02]), response=True)  # stop ACC
+                print("Sent PMD stop commands")
+            except Exception as e:
+                print(f"Error sending PMD stop commands: {e}")
+
             # Stop notifications
             try:
                 await self.client.stop_notify(HEART_RATE_UUID)
@@ -2132,10 +2316,10 @@ class PolarStreamRecorder:
                 print("Disconnected from Polar device")
             except Exception as e:
                 print(f"Error disconnecting: {str(e)}")
-            
+
             # Clear the client
             self.client = None
-            
+
         # Clean up LSL streams
         self._cleanup_lsl_streams()
 
@@ -2149,12 +2333,12 @@ class LSLDataAnalyzer:
         # Section title with icon-like prefix
         title_frame = tk.Frame(self.parent, bg=DARKER_BG)
         title_frame.pack(fill=tk.X, pady=(0, 15))
-        
+
         section_title = tk.Label(
-            title_frame, 
-            text="◉ ANALYSIS MODULE", 
-            font=("Segoe UI", 16, "bold"), 
-            fg=ACCENT_COLOR, 
+            title_frame,
+            text="◉ ANALYSIS MODULE",
+            font=("Segoe UI", 16, "bold"),
+            fg=ACCENT_COLOR,
             bg=DARKER_BG,
             anchor="w"
         )
@@ -2163,19 +2347,19 @@ class LSLDataAnalyzer:
         # Participant ID section with modern styling
         participant_frame = tk.Frame(self.parent, bg=DARKER_BG, pady=10)
         participant_frame.pack(fill=tk.X)
-        
+
         self.participant_id_label = tk.Label(
-            participant_frame, 
-            text="PARTICIPANT ID", 
-            font=("Segoe UI", 10), 
-            bg=DARKER_BG, 
+            participant_frame,
+            text="PARTICIPANT ID",
+            font=("Segoe UI", 10),
+            bg=DARKER_BG,
             fg=SECONDARY_TEXT,
             anchor="w"
         )
         self.participant_id_label.pack(fill=tk.X)
-        
+
         self.participant_id_entry = tk.Entry(
-            participant_frame, 
+            participant_frame,
             font=("Segoe UI", 14),
             bg=DARK_BG,
             fg=TEXT_COLOR,
@@ -2185,17 +2369,17 @@ class LSLDataAnalyzer:
             highlightthickness=1
         )
         self.participant_id_entry.pack(fill=tk.X, pady=(5, 0))
-        
+
         # Bind Enter key to load data
         self.participant_id_entry.bind('<Return>', lambda event: self.load_data())
 
         # Load Data Button with modern styling
         button_frame = tk.Frame(self.parent, bg=DARKER_BG, pady=10)
         button_frame.pack(fill=tk.X)
-        
+
         self.load_button = tk.Button(
-            button_frame, 
-            text="LOAD DATA", 
+            button_frame,
+            text="LOAD DATA",
             font=("Segoe UI", 12, "bold"),
             bg=ACCENT_COLOR,
             fg=DARKER_BG,
@@ -2211,20 +2395,20 @@ class LSLDataAnalyzer:
         # Results Display with modern styling
         results_frame = tk.Frame(self.parent, bg=DARKER_BG, pady=10)
         results_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         results_header = tk.Label(
-            results_frame, 
-            text="ANALYSIS RESULTS", 
-            font=("Segoe UI", 10), 
-            bg=DARKER_BG, 
+            results_frame,
+            text="ANALYSIS RESULTS",
+            font=("Segoe UI", 10),
+            bg=DARKER_BG,
             fg=SECONDARY_TEXT,
             anchor="w"
         )
         results_header.pack(fill=tk.X)
-        
+
         self.results_text = tk.Text(
-            results_frame, 
-            wrap=tk.WORD, 
+            results_frame,
+            wrap=tk.WORD,
             font=("Segoe UI", 12),
             bg=DARK_BG,
             fg=TEXT_COLOR,
@@ -2259,7 +2443,7 @@ class LSLDataAnalyzer:
                 reader = csv.reader(marked_file)
                 next(reader)  # Header überspringen
                 marked_timestamps = [float(row[0]) for row in reader]
-                
+
         # Laden der Intervalle
         intervals = []
         intervals_filename = os.path.join(participant_folder, "intervals.csv")
@@ -2296,7 +2480,7 @@ class LSLDataAnalyzer:
 
             # Segmentierung anhand von Pausen (wenn Timestamp-Differenz > 10 Sek.)
             segments = []
-            current_segment = []
+            current_segment = [data[0]]
             for i in range(1, len(data)):
                 timestamp_diff = data[i][0] - data[i - 1][0]
                 if timestamp_diff > 10:  # Wenn mehr als 10 Sek. Pause, dann neue Episode
@@ -2392,7 +2576,7 @@ class LSLDataAnalyzer:
 
                 else:
                     self.results_text.insert(tk.END, "  No Marked Timestamps Available for This Segment\n\n")
-                    
+
                 # Analyse der Intervalle innerhalb dieses Segments
                 if intervals:
                     segment_intervals = []
@@ -2414,15 +2598,15 @@ class LSLDataAnalyzer:
                                     rr_diff = np.diff(interval_values)
                                     rmssd_interval = np.sqrt(np.mean(rr_diff ** 2)) if len(rr_diff) > 0 else None
                                     sdnn_interval = np.std(interval_values, ddof=1)
-                                
-                                segment_intervals.append((start_interval, end_interval, duration, mean_interval, 
-                                                       median_interval, min_interval, max_interval, std_dev_interval, 
+
+                                segment_intervals.append((start_interval, end_interval, duration, mean_interval,
+                                                       median_interval, min_interval, max_interval, std_dev_interval,
                                                        iqr_interval, rmssd_interval, sdnn_interval))
-                    
+
                     # Output interval results
                     if segment_intervals:
-                        self.results_text.insert(tk.END, f"  Interval Analysis:\n")
-                        for i, (start_interval, end_interval, duration, mean_interval, median_interval, min_interval, 
+                        self.results_text.insert(tk.END, "  Interval Analysis:\n")
+                        for i, (start_interval, end_interval, duration, mean_interval, median_interval, min_interval,
                                max_interval, std_dev_interval, iqr_interval, rmssd_interval, sdnn_interval) in enumerate(segment_intervals):
                             self.results_text.insert(tk.END, f"    Interval {i + 1} ({start_interval:.2f} - {end_interval:.2f}s):\n")
                             self.results_text.insert(tk.END, f"      Duration: {duration:.2f} seconds\n")
@@ -2436,11 +2620,11 @@ class LSLDataAnalyzer:
                                 self.results_text.insert(tk.END, f"      RMSSD: {rmssd_interval:.2f}\n")
                             if sdnn_interval is not None:
                                 self.results_text.insert(tk.END, f"      SDNN: {sdnn_interval:.2f}\n")
-                            self.results_text.insert(tk.END, f"\n")
+                            self.results_text.insert(tk.END, "\n")
                     else:
-                        self.results_text.insert(tk.END, f"  No Intervals Available for This Segment\n\n")
+                        self.results_text.insert(tk.END, "  No Intervals Available for This Segment\n\n")
                 else:
-                    self.results_text.insert(tk.END, f"  No Intervals Available for This Segment\n\n")
+                    self.results_text.insert(tk.END, "  No Intervals Available for This Segment\n\n")
 
 
 if __name__ == "__main__":
